@@ -1,0 +1,71 @@
+name: Create tagged release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (currently v1.1.2)
+        required: true
+        default: v1.1.2
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10.11'
+          architecture: x64
+      - name: Match the release tag to the source version
+        shell: powershell
+        run: |
+          $version = (Get-Content -LiteralPath VERSION -Raw).Trim()
+          if ($env:RELEASE_TAG -ne ('v'+$version)) { throw 'Release tag must match VERSION.' }
+      - name: Install pinned build requirements
+        run: python -m pip install -r requirements-build.txt
+      - name: Fetch verified compiler and corresponding Qt source archives
+        run: |
+          python scripts/fetch_toolchain.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/fetch_third_party_sources.py
+      - name: Build every native library from source
+        run: python scripts/build_native.py
+      - name: Run offline tests
+        run: python scripts/run_offline_tests.py
+      - name: Build the replaceable-library application bundle
+        run: python scripts/build_app.py
+      - name: Assemble installer, complete payload and corresponding sources
+        run: python scripts/assemble_release.py --version ($env:RELEASE_TAG.Substring(1))
+      - name: Verify release assets
+        run: python scripts/verify_release.py
+      - name: Create a draft without replacing an existing release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'GitHub CLI is required on the runner.' }
+          $previousPreference = $ErrorActionPreference
+          try {
+            $ErrorActionPreference = 'Continue'
+            gh release view $env:RELEASE_TAG --json id 2>$null
+            $releaseExists = $LASTEXITCODE -eq 0
+          } finally { $ErrorActionPreference = $previousPreference }
+          if ($releaseExists) { throw 'A release for this tag already exists; it was left unchanged.' }
+          $folder = Join-Path $PWD ('dist\release\'+$env:RELEASE_TAG)
+          $assets = @(Get-ChildItem -LiteralPath $folder -File | ForEach-Object { $_.FullName })
+          gh release create $env:RELEASE_TAG @assets --draft --verify-tag --title ('PriPara Virtual Camera '+$env:RELEASE_TAG) --notes-file docs/RELEASING.md
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release creation failed.' }
